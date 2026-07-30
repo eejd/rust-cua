@@ -780,6 +780,20 @@ pub(crate) fn build_elements_array_with_token(
             if let Some(parent) = node.parent_element_index {
                 entry["parent_index"] = serde_json::json!(parent);
             }
+            // uirunner-structured-identifiers-v1: every addressable row must
+            // carry its own `identifier` key, independent of `label`'s
+            // title→description→value→identifier collapse above. Portable
+            // fixture selectors (eejd/swift-uirunner-broker) key off this
+            // field and must never fall back to a label string, which is
+            // free-form display text and not stable across locales/redraws.
+            // Elements without a real AXIdentifier get a synthesized one
+            // scoped to this snapshot so the key is never absent.
+            entry["identifier"] = serde_json::Value::String(
+                node.identifier
+                    .clone()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| format!("auto:{snapshot_id}:{idx}")),
+            );
             Some(entry)
         })
         .collect()
@@ -1139,6 +1153,32 @@ mod tests {
         );
         assert_eq!(entry["role"], "AXUnknown");
         assert_eq!(entry["depth"], 0);
+    }
+
+    /// uirunner-structured-identifiers-v1: `identifier` is never omitted,
+    /// unlike every other optional field above — portable selectors must
+    /// always have a stable key to address a row by, even when the AX tree
+    /// supplied no AXIdentifier.
+    #[test]
+    fn elements_identifier_always_present() {
+        let nodes = vec![node(Some(0), "AXUnknown", None, 0, None, None)];
+        let entry = &build_elements_array(&nodes)[0];
+        let id = entry["identifier"]
+            .as_str()
+            .expect("identifier must always be a string");
+        assert!(!id.is_empty(), "identifier must never be empty");
+        assert!(
+            id.starts_with("auto:"),
+            "missing AXIdentifier must synthesize a snapshot-scoped id: {id}"
+        );
+    }
+
+    #[test]
+    fn elements_identifier_uses_real_ax_identifier_when_present() {
+        let mut nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None)];
+        nodes[0].identifier = Some("save-button".into());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["identifier"], "save-button");
     }
 
     #[test]
