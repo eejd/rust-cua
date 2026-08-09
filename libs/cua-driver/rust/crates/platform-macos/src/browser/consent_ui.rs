@@ -3,7 +3,6 @@
 use std::time::{Duration, Instant};
 use std::{collections::HashSet, iter};
 
-use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::browser::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserRefusal, BrowserRefusalCode,
 };
@@ -35,12 +34,6 @@ fn normalized_text(node: &AXNode) -> String {
     .join(" ")
     .trim()
     .to_ascii_lowercase()
-}
-
-fn release_actionable_nodes(nodes: &[AXNode]) {
-    for node in nodes.iter().filter(|node| node.element_index.is_some()) {
-        unsafe { CFRelease(node.element_ptr as CFTypeRef) };
-    }
 }
 
 fn consent_surface_ids(
@@ -193,16 +186,10 @@ pub async fn handle(
         candidates.sort_unstable();
         candidates.dedup();
         if let Some(error) = matcher_error {
-            for nodes in &trees {
-                release_actionable_nodes(nodes);
-            }
             return Err(error);
         }
         if let [element] = candidates.as_slice() {
             let pressed = unsafe { perform_action(*element as AXUIElementRef, "AXPress") };
-            for nodes in &trees {
-                release_actionable_nodes(nodes);
-            }
             if pressed != kAXErrorSuccess {
                 return Err(refusal(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
@@ -217,9 +204,6 @@ pub async fn handle(
             accepted_prompt = true;
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
-        }
-        for nodes in &trees {
-            release_actionable_nodes(nodes);
         }
         if candidates.len() > 1 {
             return Err(refusal(
@@ -264,6 +248,7 @@ mod tests {
             help: None,
             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
             element_ptr: 7,
+            element_owner: None,
             depth,
             parent_element_index: None,
             frame: None,

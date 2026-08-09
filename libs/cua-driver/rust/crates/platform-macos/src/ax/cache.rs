@@ -8,16 +8,17 @@
 //! for the same (pid, window_id) replaces the entire entry.
 //!
 //! Memory contract:
-//!   tree::walk_element retains each actionable element before storing its ptr.
-//!   CachedSnapshot::drop releases those retains so we have no AX leaks.
+//!   tree::walk_element gives each actionable AXNode an RAII-owned retain.
+//!   Cache update clones that ownership; dropping either side releases exactly
+//!   its own retain, including cancelled or discarded tree-walk results.
 //!
 //! The locked-HashMap plumbing lives in `cua_driver_core::element_cache` — see
 //! `docs/dedup-audit.md` item #3. This module owns the macOS-specific
-//! `CacheKey`, `CachedSnapshot`, and the `Drop` impl that fires `CFRelease`
+//! `CacheKey` and `CachedSnapshot`; the stored RAII guards release themselves
 //! when an entry is replaced or removed.
 
 use super::bindings::AXUIElementRef;
-use super::tree::AXNode;
+use super::tree::{AXNode, OwnedAXElement};
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::element_cache::ElementCacheCore;
 
@@ -61,19 +62,8 @@ pub struct CacheKey {
 
 /// Cached snapshot for one (pid, window_id) pair.
 pub struct CachedSnapshot {
-    /// element_index → raw AXUIElementRef pointer (retained, as usize for Send).
-    pub elements: Vec<usize>,
-}
-
-impl Drop for CachedSnapshot {
-    fn drop(&mut self) {
-        // Release the extra CFRetain that walk_element added for each cached ptr.
-        for ptr in &self.elements {
-            if *ptr != 0 {
-                unsafe { CFRelease(*ptr as AXUIElementRef as CFTypeRef) };
-            }
-        }
-    }
+    /// element_index → independently owned AX element.
+    pub elements: Vec<OwnedAXElement>,
 }
 
 /// Global element cache.
@@ -90,10 +80,9 @@ impl ElementCache {
 
     /// Replace the snapshot for (pid, window_id) with the nodes from a fresh walk.
     pub fn update(&self, pid: i32, window_id: u32, nodes: &[AXNode]) {
-        let elements: Vec<usize> = nodes
+        let elements: Vec<OwnedAXElement> = nodes
             .iter()
-            .filter(|n| n.element_index.is_some())
-            .map(|n| n.element_ptr)
+            .filter_map(|n| n.element_owner.clone())
             .collect();
         self.core
             .insert(CacheKey { pid, window_id }, CachedSnapshot { elements });
@@ -114,7 +103,7 @@ impl ElementCache {
     ) -> Option<RetainedElement> {
         self.core
             .with_snapshot(&CacheKey { pid, window_id }, |s| {
-                let ptr = s.elements.get(element_index).copied()?;
+                let ptr = s.elements.get(element_index)?.as_ptr();
                 if ptr != 0 {
                     // Safety: still inside `with_snapshot`'s lock, so the
                     // snapshot (and thus this CFTypeRef) is alive right now.
@@ -159,6 +148,7 @@ mod tests {
             help: None,
             actions: Vec::new(),
             element_ptr: ptr,
+            element_owner: Some(unsafe { OwnedAXElement::retaining(ptr as AXUIElementRef) }),
             depth: 0,
             parent_element_index: None,
             frame: None,
@@ -183,9 +173,6 @@ mod tests {
         let ptr = s.as_concrete_TypeRef() as usize;
         let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
 
-        // walk_element's contract: the producer retains before handing the ptr
-        // to the cache, and CachedSnapshot::drop releases that retain.
-        unsafe { CFRetain(ptr as CFTypeRef) };
         let cache = ElementCache::new();
         cache.update(1, 2, &[node_with_ptr(ptr)]);
         assert_eq!(
@@ -220,6 +207,22 @@ mod tests {
             base,
             "guard drop releases its retain"
         );
+    }
+
+    #[test]
+    fn discarded_nodes_and_clones_release_every_owned_retain() {
+        let s = CFString::new("cua-driver-raii-discard-test-element-placeholder");
+        let ptr = s.as_concrete_TypeRef() as usize;
+        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+
+        let node = node_with_ptr(ptr);
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
+        let clone = node.clone();
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 2);
+        drop(node);
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
+        drop(clone);
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
     }
 
     /// A missing index returns None without retaining anything.

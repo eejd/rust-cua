@@ -261,7 +261,15 @@ impl Tool for GetWindowStateTool {
         // refusals against what the walk actually observed.
         let window_scope = tree_result.as_ref().and_then(|r| r.window_scope.clone());
         if let Some(ref scope) = window_scope {
-            if let Some(refusal) = window_scope_refusal(pid, window_id, scope) {
+            if let Some(mut refusal) = window_scope_refusal(pid, window_id, scope) {
+                if let Some(ref mut structured) = refusal.structured_content {
+                    if let Some(object) = structured.as_object_mut() {
+                        object.insert(
+                            "ax_diagnostics".into(),
+                            ax_diagnostics_json(tree_result.as_ref(), scope, pid, window_id),
+                        );
+                    }
+                }
                 return refusal;
             }
         }
@@ -498,6 +506,9 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if let (Some(result), Some(scope)) = (tree_result.as_ref(), window_scope.as_ref()) {
+            structured["ax_diagnostics"] = ax_diagnostics_json(Some(result), scope, pid, window_id);
+        }
         // Surface 6: an opaque snapshot identifier consumers can log
         // alongside the per-element tokens for debug correlation. Same value
         // embedded in every `element_token` emitted in `elements[]` above.
@@ -666,6 +677,30 @@ enum Degradation {
     /// The requested window is live and owned by this pid, but no AXWindow
     /// claims its CGWindowID, so the walk deliberately covered nothing.
     AxWindowUnresolved { ax_window_count: usize },
+}
+
+fn ax_diagnostics_json(
+    result: Option<&crate::ax::tree::TreeWalkResult>,
+    scope: &crate::ax::WindowScope,
+    pid: i32,
+    window_id: u32,
+) -> serde_json::Value {
+    use crate::ax::WindowScope;
+    let mut value =
+        serde_json::to_value(result.map(|r| &r.diagnostics).cloned().unwrap_or_default())
+            .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("pid".into(), serde_json::json!(pid));
+        object.insert("requested_window_id".into(), serde_json::json!(window_id));
+        let scope_name = match scope {
+            WindowScope::Matched => "matched",
+            WindowScope::NotFound => "not_found",
+            WindowScope::OwnerPidMismatch { .. } => "owner_pid_mismatch",
+            WindowScope::AxUnresolved { .. } => "ax_unresolved",
+        };
+        object.insert("scope".into(), serde_json::json!(scope_name));
+    }
+    value
 }
 
 /// Decide the degradation rung. Pure: `walk_attempted` is false in the
@@ -959,6 +994,7 @@ mod tests {
             help: None,
             actions: vec![],
             element_ptr: 0,
+            element_owner: None,
             depth,
             parent_element_index: parent,
             frame,
