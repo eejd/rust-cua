@@ -38,12 +38,6 @@ fn has_action(node: &AXNode, action: &str) -> bool {
     node.actions.iter().any(|value| value == action)
 }
 
-fn release_actionable_nodes(nodes: &[AXNode]) {
-    for node in nodes.iter().filter(|node| node.element_index.is_some()) {
-        unsafe { CFRelease(node.element_ptr as CFTypeRef) };
-    }
-}
-
 fn unique_actionable(
     nodes: &[AXNode],
     role: &str,
@@ -858,7 +852,6 @@ fn press_pixel_checkbox(
             }
             Ok(refreshed)
         })();
-        release_actionable_nodes(&current.nodes);
         let refreshed = validation?;
         crate::input::mouse::click_at_xy_with_window_local(
             pid,
@@ -942,7 +935,6 @@ impl SetupUiHandle {
                                 let center =
                                     unsafe { element_screen_center(element as AXUIElementRef) };
                                 trusted_fallback_attempted = true;
-                                release_actionable_nodes(&tree.nodes);
                                 let Some((x, y)) = center else {
                                     return false;
                                 };
@@ -1007,7 +999,6 @@ impl SetupUiHandle {
                                 Some(false)
                             } else {
                                 trusted_fallback_attempted = true;
-                                release_actionable_nodes(&tree.nodes);
                                 self.injected_global_input = true;
                                 match press_pixel_checkbox(
                                     pid,
@@ -1029,7 +1020,6 @@ impl SetupUiHandle {
                 }
                 Err(_) => Some(false),
             };
-            release_actionable_nodes(&tree.nodes);
             if let Some(done) = result {
                 if done {
                     self.enabled_remote_debugging = false;
@@ -1197,13 +1187,11 @@ pub fn enable(
             let new_tab = match new_tab {
                 Ok(element) => element,
                 Err(error) => {
-                    release_actionable_nodes(&initial.nodes);
                     return Err(error);
                 }
             };
             let pressed = unsafe { perform_action(new_tab as AXUIElementRef, "AXPress") };
             if pressed != kAXErrorSuccess {
-                release_actionable_nodes(&initial.nodes);
                 return Err(refusal(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     format!(
@@ -1218,12 +1206,9 @@ pub fn enable(
                 match new_tab_close_button(&initial.nodes, &created.nodes, descriptor) {
                     Ok(Some(element)) => break (created, element),
                     Ok(None) if Instant::now() < deadline => {
-                        release_actionable_nodes(&created.nodes);
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     Ok(None) => {
-                        release_actionable_nodes(&initial.nodes);
-                        release_actionable_nodes(&created.nodes);
                         return Err(refusal(
                             BrowserRefusalCode::BrowserWrongTargetRefused,
                             format!(
@@ -1240,8 +1225,6 @@ pub fn enable(
                         })));
                     }
                     Err(error) => {
-                        release_actionable_nodes(&initial.nodes);
-                        release_actionable_nodes(&created.nodes);
                         return Err(error.with_detail(serde_json::json!({
                             "setup_side_effects": {
                                 "opened_setup_page": "unknown",
@@ -1252,7 +1235,6 @@ pub fn enable(
                     }
                 }
             };
-            release_actionable_nodes(&initial.nodes);
             let mut handle = SetupUiHandle {
                 descriptor,
                 close_button: Some(close_button),
@@ -1273,13 +1255,11 @@ pub fn enable(
             let omnibox = match omnibox {
                 Ok(element) => element,
                 Err(error) => {
-                    release_actionable_nodes(&created.nodes);
                     return Err(handle.abort(pid, window_id, error));
                 }
             };
             let focused = unsafe { perform_action(omnibox as AXUIElementRef, "AXPress") };
             if focused != kAXErrorSuccess {
-                release_actionable_nodes(&created.nodes);
                 return Err(handle.abort(
                     pid,
                     window_id,
@@ -1297,7 +1277,6 @@ pub fn enable(
                 set_string_attr(omnibox as AXUIElementRef, "AXValue", descriptor.setup_url)
             };
             if wrote_url != kAXErrorSuccess {
-                release_actionable_nodes(&created.nodes);
                 return Err(handle.abort(
                     pid,
                     window_id,
@@ -1320,7 +1299,6 @@ pub fn enable(
                 && unsafe { perform_action(omnibox as AXUIElementRef, "AXConfirm") }
                     == kAXErrorSuccess;
             unsafe { CFRetain(omnibox as CFTypeRef) };
-            release_actionable_nodes(&created.nodes);
             if !exact_value {
                 unsafe { CFRelease(omnibox as CFTypeRef) };
                 return Err(handle.abort(
@@ -1344,15 +1322,12 @@ pub fn enable(
                     match exact_omnibox_suggestion(&popup.nodes, descriptor) {
                         Ok(Some(element)) => break Ok(Some((popup, element))),
                         Ok(None) if Instant::now() < deadline => {
-                            release_actionable_nodes(&popup.nodes);
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         Ok(None) => {
-                            release_actionable_nodes(&popup.nodes);
                             break Ok(None);
                         }
                         Err(error) => {
-                            release_actionable_nodes(&popup.nodes);
                             break Err(error);
                         }
                     }
@@ -1362,7 +1337,6 @@ pub fn enable(
                         unsafe { CFRelease(omnibox as CFTypeRef) };
                         let navigation =
                             unsafe { perform_action(suggestion as AXUIElementRef, "AXPress") };
-                        release_actionable_nodes(&popup.nodes);
                         if navigation != kAXErrorSuccess {
                             return Err(handle.abort(
                                 pid,
@@ -1478,14 +1452,9 @@ pub fn enable(
             handle
         }
         Err(error) => {
-            release_actionable_nodes(&initial.nodes);
             return Err(error);
         }
     };
-    if !handle.opened_setup_page {
-        release_actionable_nodes(&initial.nodes);
-    }
-
     let deadline = Instant::now() + EXISTING_PROFILE_SETUP_READY_TIMEOUT;
     loop {
         let tree = walk_tree(pid, Some(window_id), None);
@@ -1498,7 +1467,6 @@ pub fn enable(
                         if handle.enable_attempted || handle.remote_debugging_mutation_possible {
                             handle.enabled_remote_debugging = true;
                         }
-                        release_actionable_nodes(&tree.nodes);
                         return Ok(handle);
                     }
                     Ok(CheckboxState::Off) => {
@@ -1507,7 +1475,6 @@ pub fn enable(
                             handle.remote_debugging_mutation_possible = true;
                             let pressed =
                                 unsafe { perform_action(element as AXUIElementRef, "AXPress") };
-                            release_actionable_nodes(&tree.nodes);
                             if pressed != kAXErrorSuccess {
                                 return Err(handle.abort(pid, window_id, refusal(
                                     BrowserRefusalCode::BrowserWrongTargetRefused,
@@ -1523,7 +1490,6 @@ pub fn enable(
                             let center =
                                 unsafe { element_screen_center(element as AXUIElementRef) };
                             handle.trusted_checkbox_fallback_attempted = true;
-                            release_actionable_nodes(&tree.nodes);
                             let Some((x, y)) = center else {
                                 return Err(handle.abort(
                                     pid,
@@ -1574,11 +1540,8 @@ pub fn enable(
                             }
                             continue;
                         }
-
-                        release_actionable_nodes(&tree.nodes);
                     }
                     Err(error) => {
-                        release_actionable_nodes(&tree.nodes);
                         return Err(handle.abort(pid, window_id, error));
                     }
                 }
@@ -1601,7 +1564,6 @@ pub fn enable(
                         .pixel_checkbox
                         .is_some_and(|original| !original.same_control_as(checkbox, 3.0))
                     {
-                        release_actionable_nodes(&tree.nodes);
                         return Err(handle.abort(
                             pid,
                             window_id,
@@ -1617,7 +1579,6 @@ pub fn enable(
                     if handle.remote_debugging_mutation_possible {
                         handle.enabled_remote_debugging = true;
                     }
-                    release_actionable_nodes(&tree.nodes);
                     return Ok(handle);
                 }
                 Ok(Some(checkbox)) if !handle.pixel_checkbox_fallback_attempted => {
@@ -1625,7 +1586,6 @@ pub fn enable(
                     handle.remote_debugging_mutation_possible = true;
                     handle.pixel_checkbox = Some(checkbox);
                     handle.used_bounded_pixel_fallback = true;
-                    release_actionable_nodes(&tree.nodes);
                     handle.injected_global_input = true;
                     match press_pixel_checkbox(
                         pid,
@@ -1651,14 +1611,12 @@ pub fn enable(
                     }
                     continue;
                 }
-                Ok(Some(_)) | Ok(None) => release_actionable_nodes(&tree.nodes),
+                Ok(Some(_)) | Ok(None) => {}
                 Err(error) => {
-                    release_actionable_nodes(&tree.nodes);
                     return Err(handle.abort(pid, window_id, error));
                 }
             },
             Err(error) => {
-                release_actionable_nodes(&tree.nodes);
                 return Err(handle.abort(pid, window_id, error));
             }
         }
@@ -1699,6 +1657,7 @@ mod tests {
             help: None,
             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
             element_ptr: 7,
+            element_owner: None,
             depth: 0,
             parent_element_index: None,
             frame: None,
@@ -1724,6 +1683,7 @@ mod tests {
             nodes,
             truncated: false,
             window_scope: Some(crate::ax::WindowScope::Matched),
+            diagnostics: Default::default(),
         }
     }
 
@@ -1852,6 +1812,7 @@ mod tests {
             nodes: Vec::new(),
             truncated: true,
             window_scope: Some(crate::ax::WindowScope::Matched),
+            diagnostics: Default::default(),
         };
         assert!(
             exact_pixel_setup_checkbox(0, &truncated, 0, chrome(), false)

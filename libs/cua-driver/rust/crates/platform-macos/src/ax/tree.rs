@@ -13,7 +13,8 @@
 use super::bindings::*;
 use super::window_scope::{decide_window_scope, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
-use std::collections::HashSet;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 /// Default maximum depth for AX tree walks. Deep menus and complex web views
@@ -61,6 +62,47 @@ fn enabled_pids() -> &'static Mutex<HashSet<i32>> {
     ENABLED_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// An owned retain of one AX element. Tree nodes and cache snapshots clone this
+/// guard when they need independent lifetimes; each clone has one matching
+/// `CFRetain`/`CFRelease` pair.
+#[derive(Debug)]
+pub(crate) struct OwnedAXElement(usize);
+
+impl OwnedAXElement {
+    /// Retain `element` and return an independently owned guard.
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a valid AXUIElementRef for the duration of this call.
+    pub(crate) unsafe fn retaining(element: AXUIElementRef) -> Self {
+        CFRetain(element as CFTypeRef);
+        Self(element as usize)
+    }
+
+    pub(crate) fn as_ptr(&self) -> usize {
+        self.0
+    }
+}
+
+impl Clone for OwnedAXElement {
+    fn clone(&self) -> Self {
+        if self.0 != 0 {
+            unsafe { CFRetain(self.0 as AXUIElementRef as CFTypeRef) };
+        }
+        Self(self.0)
+    }
+}
+
+unsafe impl Send for OwnedAXElement {}
+
+impl Drop for OwnedAXElement {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { CFRelease(self.0 as AXUIElementRef as CFTypeRef) };
+        }
+    }
+}
+
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
@@ -80,6 +122,9 @@ pub struct AXNode {
     pub actions: Vec<String>,
     /// The raw AXUIElementRef pointer value, for caching.
     pub element_ptr: usize,
+    /// Independent ownership for actionable elements. Non-actionable nodes do
+    /// not escape a walk as action targets and therefore carry no retain.
+    pub(crate) element_owner: Option<OwnedAXElement>,
     /// Depth in the rendered markdown tree (matches the indent level used in
     /// `tree_markdown`). Layout containers AXScrollArea/AXGroup collapse so
     /// children share the parent's depth.
@@ -105,6 +150,79 @@ pub struct AXNode {
     pub enabled: Option<bool>,
     /// AXSelected. `None` when the app doesn't report the attribute.
     pub selected: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AXCollectionDiagnostic {
+    pub status_code: i32,
+    pub status_name: String,
+    pub value_present: bool,
+    pub type_valid: bool,
+    pub element_count: usize,
+}
+
+impl AXCollectionDiagnostic {
+    fn from_read(read: &AXElementCollectionRead) -> Self {
+        Self {
+            status_code: read.status,
+            status_name: ax_error_name(read.status).to_owned(),
+            value_present: read.value_present,
+            type_valid: read.type_valid,
+            element_count: read.elements.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AXWindowIDDiagnostic {
+    pub attempted: usize,
+    pub resolved: usize,
+    pub zero_id: usize,
+    pub status_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AXDescendantChildrenDiagnostic {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub empty: usize,
+    pub status_counts: BTreeMap<String, usize>,
+}
+
+impl AXDescendantChildrenDiagnostic {
+    fn record(&mut self, read: &AXElementCollectionRead) {
+        self.attempted += 1;
+        if read.status == kAXErrorSuccess && read.value_present && read.type_valid {
+            self.succeeded += 1;
+            if read.elements.is_empty() {
+                self.empty += 1;
+            }
+        }
+        let key = format!("{}:{}", ax_error_name(read.status), read.status);
+        *self.status_counts.entry(key).or_default() += 1;
+    }
+}
+
+impl AXWindowIDDiagnostic {
+    fn record(&mut self, read: &AXWindowIDRead) {
+        self.attempted += 1;
+        if read.window_id.is_some() {
+            self.resolved += 1;
+        } else if read.status == kAXErrorSuccess {
+            self.zero_id += 1;
+        }
+        let key = format!("{}:{}", ax_error_name(read.status), read.status);
+        *self.status_counts.entry(key).or_default() += 1;
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AXTreeDiagnostics {
+    pub application_element_created: bool,
+    pub children: Option<AXCollectionDiagnostic>,
+    pub windows: Option<AXCollectionDiagnostic>,
+    pub window_id_resolution: AXWindowIDDiagnostic,
+    pub descendant_children: AXDescendantChildrenDiagnostic,
 }
 
 #[derive(Default)]
@@ -142,6 +260,9 @@ pub struct TreeWalkResult {
     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
+    /// Raw AX call outcomes used to distinguish an empty accessibility surface
+    /// from API denial, timeout, invalid elements, and window-id SPI failures.
+    pub diagnostics: AXTreeDiagnostics,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -192,6 +313,7 @@ pub fn walk_tree_bounded(
     // avoids a false-positive when the tree naturally ends on exactly the cap.
     let mut truncated = false;
     let mut window_scope: Option<WindowScope> = None;
+    let mut diagnostics = AXTreeDiagnostics::default();
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -203,8 +325,10 @@ pub fn walk_tree_bounded(
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
+                diagnostics,
             };
         }
+        diagnostics.application_element_created = true;
         set_messaging_timeout(app_elem);
 
         // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
@@ -230,8 +354,12 @@ pub fn walk_tree_bounded(
         // Union AXChildren + AXWindows — the only way to see background windows.
         // AXChildren omits windows when the app isn't frontmost (AppKit limitation).
         // AXWindows returns the window list regardless of activation state.
-        let from_children = copy_children(app_elem);
-        let from_windows = copy_ax_windows(app_elem);
+        let children_read = copy_children_diagnostic(app_elem);
+        diagnostics.children = Some(AXCollectionDiagnostic::from_read(&children_read));
+        let from_children = children_read.elements;
+        let windows_read = copy_ax_windows_diagnostic(app_elem);
+        diagnostics.windows = Some(AXCollectionDiagnostic::from_read(&windows_read));
+        let from_windows = windows_read.elements;
 
         let mut top_level = from_children;
         for w in from_windows {
@@ -256,28 +384,28 @@ pub fn walk_tree_bounded(
         // and walks nothing; it must never fall back to "everything that isn't
         // a window", which is how issue #2237 returned menu bars as panels.
         let walk_these: Vec<AXUIElementRef> = if let Some(wid) = window_id {
-            let candidates: Vec<TopLevelCandidate> = top_level
-                .iter()
-                .map(|&child| {
-                    set_messaging_timeout(child);
-                    let role = copy_string_attr(child, "AXRole").unwrap_or_default();
-                    let subrole = copy_string_attr(child, "AXSubrole");
-                    let identifier = copy_string_attr(child, "AXIdentifier");
-                    // Match AX window element → CGWindowID via private SPI.
-                    // Only windows carry one, so skip the round-trip elsewhere.
-                    let ax_window_id = if role == "AXWindow" {
-                        ax_get_window_id(child)
-                    } else {
-                        None
-                    };
-                    TopLevelCandidate {
-                        role,
-                        subrole,
-                        identifier,
-                        ax_window_id,
-                    }
-                })
-                .collect();
+            let mut candidates = Vec::with_capacity(top_level.len());
+            for &child in &top_level {
+                set_messaging_timeout(child);
+                let role = copy_string_attr(child, "AXRole").unwrap_or_default();
+                let subrole = copy_string_attr(child, "AXSubrole");
+                let identifier = copy_string_attr(child, "AXIdentifier");
+                // Match AX window element → CGWindowID via private SPI.
+                // Only windows carry one, so skip the round-trip elsewhere.
+                let ax_window_id = if role == "AXWindow" {
+                    let read = ax_get_window_id_diagnostic(child);
+                    diagnostics.window_id_resolution.record(&read);
+                    read.window_id
+                } else {
+                    None
+                };
+                candidates.push(TopLevelCandidate {
+                    role,
+                    subrole,
+                    identifier,
+                    ax_window_id,
+                });
+            }
             let decision = decide_window_scope(&candidates, wid, || {
                 crate::windows::resolve_window_owner(pid, wid)
             });
@@ -303,6 +431,7 @@ pub fn walk_tree_bounded(
                 &mut index_counter,
                 &mut visited_count,
                 &mut truncated,
+                &mut diagnostics.descendant_children,
                 max_elements,
                 max_depth,
             );
@@ -338,6 +467,7 @@ pub fn walk_tree_bounded(
         nodes,
         truncated: truncated_flag,
         window_scope,
+        diagnostics,
     }
 }
 
@@ -351,6 +481,7 @@ unsafe fn walk_element(
     counter: &mut usize,
     visited_count: &mut usize,
     truncated: &mut bool,
+    child_diagnostics: &mut AXDescendantChildrenDiagnostic,
     max_elements: usize,
     max_depth: usize,
 ) {
@@ -376,7 +507,9 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
+        let read = copy_children_diagnostic(element);
+        child_diagnostics.record(&read);
+        let children = read.elements;
         for child in children {
             walk_element(
                 child,
@@ -387,6 +520,7 @@ unsafe fn walk_element(
                 counter,
                 visited_count,
                 truncated,
+                child_diagnostics,
                 max_elements,
                 max_depth,
             );
@@ -425,7 +559,9 @@ unsafe fn walk_element(
     let is_actionable = !actions.is_empty();
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+        let read = copy_children_diagnostic(element);
+        child_diagnostics.record(&read);
+        let children = read.elements;
         for child in children {
             walk_element(
                 child,
@@ -436,6 +572,7 @@ unsafe fn walk_element(
                 counter,
                 visited_count,
                 truncated,
+                child_diagnostics,
                 max_elements,
                 max_depth,
             );
@@ -466,9 +603,9 @@ unsafe fn walk_element(
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;
-        // Retain so the element stays alive in the cache after `copy_children`
-        // releases the per-child ref at the end of the caller's loop.
-        CFRetain(element as CFTypeRef);
+        // Own the actionable element independently of the traversal's child
+        // reference. Cache snapshots clone this guard rather than stealing it.
+        let element_owner = OwnedAXElement::retaining(element);
         AXNode {
             element_index: Some(idx),
             role: role.clone(),
@@ -491,6 +628,7 @@ unsafe fn walk_element(
             help: help.clone(),
             actions: actions.clone(),
             element_ptr,
+            element_owner: Some(element_owner),
             depth,
             parent_element_index: parent_index,
             frame,
@@ -524,6 +662,7 @@ unsafe fn walk_element(
             help: help.clone(),
             actions: vec![],
             element_ptr,
+            element_owner: None,
             depth,
             parent_element_index: parent_index,
             frame,
@@ -545,7 +684,9 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
-    let children = copy_children(element);
+    let read = copy_children_diagnostic(element);
+    child_diagnostics.record(&read);
+    let children = read.elements;
     for child in children {
         walk_element(
             child,
@@ -556,6 +697,7 @@ unsafe fn walk_element(
             counter,
             visited_count,
             truncated,
+            child_diagnostics,
             max_elements,
             max_depth,
         );
@@ -712,5 +854,52 @@ mod tests {
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
         assert_eq!(actionable.enabled, Some(true));
+    }
+
+    #[test]
+    fn window_id_diagnostics_count_success_zero_and_errors() {
+        let mut diagnostic = AXWindowIDDiagnostic::default();
+        diagnostic.record(&AXWindowIDRead {
+            window_id: Some(42),
+            status: kAXErrorSuccess,
+        });
+        diagnostic.record(&AXWindowIDRead {
+            window_id: None,
+            status: kAXErrorSuccess,
+        });
+        diagnostic.record(&AXWindowIDRead {
+            window_id: None,
+            status: -25204,
+        });
+
+        assert_eq!(diagnostic.attempted, 3);
+        assert_eq!(diagnostic.resolved, 1);
+        assert_eq!(diagnostic.zero_id, 1);
+        assert_eq!(diagnostic.status_counts["success:0"], 2);
+        assert_eq!(diagnostic.status_counts["cannot_complete:-25204"], 1);
+    }
+
+    #[test]
+    fn descendant_child_failures_survive_diagnostic_serialization() {
+        let mut diagnostic = AXDescendantChildrenDiagnostic::default();
+        diagnostic.record(&AXElementCollectionRead {
+            elements: vec![],
+            status: kAXErrorSuccess,
+            value_present: true,
+            type_valid: true,
+        });
+        diagnostic.record(&AXElementCollectionRead {
+            elements: vec![],
+            status: -25204,
+            value_present: false,
+            type_valid: false,
+        });
+
+        let value = serde_json::to_value(diagnostic).expect("diagnostic serializes");
+        assert_eq!(value["attempted"], 2);
+        assert_eq!(value["succeeded"], 1);
+        assert_eq!(value["empty"], 1);
+        assert_eq!(value["status_counts"]["success:0"], 1);
+        assert_eq!(value["status_counts"]["cannot_complete:-25204"], 1);
     }
 }

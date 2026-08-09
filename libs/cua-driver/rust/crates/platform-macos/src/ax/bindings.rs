@@ -33,6 +33,40 @@ pub const kAXErrorAttributeUnsupported: AXError = -25205;
 pub const kAXErrorNoValue: AXError = -25212;
 pub const kAXErrorAPIDisabled: AXError = -25211;
 
+pub fn ax_error_name(error: AXError) -> &'static str {
+    match error {
+        kAXErrorSuccess => "success",
+        kAXErrorFailure => "failure",
+        -25201 => "illegal_argument",
+        kAXErrorInvalidUIElement => "invalid_ui_element",
+        -25203 => "invalid_ui_element_observer",
+        -25204 => "cannot_complete",
+        kAXErrorAttributeUnsupported => "attribute_unsupported",
+        -25206 => "action_unsupported",
+        -25207 => "notification_unsupported",
+        -25208 => "not_implemented",
+        -25209 => "notification_already_registered",
+        -25210 => "notification_not_registered",
+        kAXErrorAPIDisabled => "api_disabled",
+        kAXErrorNoValue => "no_value",
+        -25213 => "parameterized_attribute_unsupported",
+        -25214 => "not_enough_precision",
+        _ => "unknown",
+    }
+}
+
+pub struct AXElementCollectionRead {
+    pub elements: Vec<AXUIElementRef>,
+    pub status: AXError,
+    pub value_present: bool,
+    pub type_valid: bool,
+}
+
+pub struct AXWindowIDRead {
+    pub window_id: Option<u32>,
+    pub status: AXError,
+}
+
 // ── AXValue opaque type ──────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -440,21 +474,37 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
 /// # Safety
 ///
 /// `element` must be valid, and the caller must release every returned element.
-pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let attr = CFStr::new("AXChildren");
+unsafe fn copy_element_collection(
+    element: AXUIElementRef,
+    attribute: &str,
+) -> AXElementCollectionRead {
+    let attr = CFStr::new(attribute);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return AXElementCollectionRead {
+            elements: vec![],
+            status: err,
+            value_present: !value.is_null(),
+            type_valid: false,
+        };
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return vec![];
+        return AXElementCollectionRead {
+            elements: vec![],
+            status: err,
+            value_present: true,
+            type_valid: false,
+        };
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
+    let elements = (0..arr.len())
         .filter_map(|i| {
             let item = *arr.get(i)?;
             if core_foundation::base::CFGetTypeID(item) == ax_type_id {
@@ -465,7 +515,21 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
                 None
             }
         })
-        .collect()
+        .collect();
+    AXElementCollectionRead {
+        elements,
+        status: err,
+        value_present: true,
+        type_valid: true,
+    }
+}
+
+pub unsafe fn copy_children_diagnostic(element: AXUIElementRef) -> AXElementCollectionRead {
+    copy_element_collection(element, "AXChildren")
+}
+
+pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    copy_children_diagnostic(element).elements
 }
 
 /// Copy an AX element-valued attribute. The returned element is retained and
@@ -577,14 +641,17 @@ pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool
 /// # Safety
 ///
 /// `element` must be a valid, live window `AXUIElementRef`.
-pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
+pub unsafe fn ax_get_window_id_diagnostic(element: AXUIElementRef) -> AXWindowIDRead {
     let mut wid: u32 = 0;
     let err = _AXUIElementGetWindow(element, &mut wid);
-    if err == kAXErrorSuccess && wid != 0 {
-        Some(wid)
-    } else {
-        None
+    AXWindowIDRead {
+        window_id: (err == kAXErrorSuccess && wid != 0).then_some(wid),
+        status: err,
     }
+}
+
+pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
+    ax_get_window_id_diagnostic(element).window_id
 }
 
 /// Read the `AXWindows` attribute of an application element.
@@ -594,31 +661,12 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 /// # Safety
 ///
 /// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_ax_windows_diagnostic(element: AXUIElementRef) -> AXElementCollectionRead {
+    copy_element_collection(element, "AXWindows")
+}
+
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let attr = CFStr::new("AXWindows");
-    let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
-    }
-    let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
-        CFRelease(value);
-        return vec![];
-    }
-    let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
-    let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
-        .filter_map(|i| {
-            let item = *arr.get(i)?;
-            if core_foundation::base::CFGetTypeID(item) == ax_type_id {
-                CFRetain(item);
-                Some(item as AXUIElementRef)
-            } else {
-                None
-            }
-        })
-        .collect()
+    copy_ax_windows_diagnostic(element).elements
 }
 
 #[cfg(test)]
@@ -653,5 +701,13 @@ mod tests {
         let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    #[test]
+    fn ax_error_names_preserve_known_and_unknown_statuses() {
+        assert_eq!(ax_error_name(kAXErrorSuccess), "success");
+        assert_eq!(ax_error_name(-25204), "cannot_complete");
+        assert_eq!(ax_error_name(kAXErrorAPIDisabled), "api_disabled");
+        assert_eq!(ax_error_name(-99999), "unknown");
     }
 }
