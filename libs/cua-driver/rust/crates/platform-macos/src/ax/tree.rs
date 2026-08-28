@@ -685,8 +685,8 @@ unsafe fn walk_element(
     };
 
     // Track this node as the parent for its descendants only when it was
-    // assigned an element_index (mirrors what the markdown shows: only
-    // indexed rows are addressable in click(element_index=N)).
+    // assigned an element_index (mirrors what the markdown shows: only indexed
+    // rows are addressable; callers must choose a capability-compatible tool).
     let next_parent = node.element_index.or(parent_index);
 
     let line = format_node_line(&node);
