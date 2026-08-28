@@ -25,9 +25,11 @@ fn def() -> &'static ToolDef {
         name: "get_window_state".into(),
         description: "Walk a running app's AX tree and return BOTH a structured \
             `elements` array (preferred) AND a Markdown rendering of the same tree \
-            (back-compat). Every actionable element is tagged with [element_index N] \
+            (back-compat). Every addressable element is tagged with [element_index N] \
             in the markdown and as `element_index` in the structured array — pass \
-            those indices to click, type_text, press_key, etc.\n\n\
+            an index to an operation compatible with that element's capabilities \
+            (for example, click for an AXPress action or set_value for a writable \
+            AXValue).\n\n\
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
             element-indexed action. The index map is replaced by the next snapshot.\n\n\
             PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
@@ -460,7 +462,7 @@ impl Tool for GetWindowStateTool {
             .unwrap_or_default();
 
         // Surface 6: register a snapshot in the global token registry so
-        // every actionable element gets an opaque `element_token` keyed
+        // every addressable element gets an opaque `element_token` keyed
         // to (pid, this snapshot id). The integer `element_index` stays
         // alongside unchanged — the token is additive. Snapshot id is
         // generated even when the walk returned no elements so consumers
@@ -484,7 +486,7 @@ impl Tool for GetWindowStateTool {
             None
         };
 
-        // Build the structured `elements` array — one entry per actionable
+        // Build the structured `elements` array — one entry per addressable
         // node, matching the order (and indices) of the markdown rendering.
         // This is the preferred consumption path; `tree_markdown` is kept
         // alongside for back-compat with existing text-parsing callers
@@ -531,7 +533,7 @@ impl Tool for GetWindowStateTool {
             Degradation::AxTreeEmpty => {
                 structured["degraded"] = serde_json::json!(true);
                 structured["degraded_reason"] = serde_json::json!(
-                    "ax_tree_empty: the AX walk returned no actionable elements. The \
+                    "ax_tree_empty: the AX walk returned no addressable elements. The \
                      window may be a non-AX surface (canvas/WebGL/custom-drawn) or its \
                      accessibility tree was not ready (Chromium/Electron require an \
                      AX-enable + settle). Do not treat element data as authoritative — \
@@ -672,7 +674,7 @@ fn window_scope_refusal(
 enum Degradation {
     /// Clean snapshot — no `degraded` field is emitted.
     None,
-    /// A walk ran and produced no actionable elements.
+    /// A walk ran and produced no addressable elements.
     AxTreeEmpty,
     /// The requested window is live and owned by this pid, but no AXWindow
     /// claims its CGWindowID, so the walk deliberately covered nothing.
@@ -1037,11 +1039,7 @@ mod tests {
             ),
         ];
         let elements = build_elements_array(&nodes);
-        assert_eq!(
-            elements.len(),
-            3,
-            "non-actionable rows must be filtered out"
-        );
+        assert_eq!(elements.len(), 3, "display-only rows must be filtered out");
         let indices: Vec<u64> = elements
             .iter()
             .map(|e| e["element_index"].as_u64().unwrap())

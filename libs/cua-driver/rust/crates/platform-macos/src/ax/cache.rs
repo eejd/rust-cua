@@ -1,14 +1,14 @@
 //! Per-(pid, window_id) element cache.
 //!
-//! After `get_window_state`, each actionable element's AXUIElementRef pointer
-//! is cached by element_index. Subsequent `click`, `type_text`, etc. look up
-//! the element_index to get the raw pointer and perform AX actions on it.
+//! After `get_window_state`, each addressable element's AXUIElementRef pointer
+//! is cached by element_index. Subsequent tools look up the element_index to get
+//! the raw pointer and perform a capability-compatible AX operation on it.
 //!
 //! Cache is scoped per (pid, window_id) — a new `get_window_state` call
 //! for the same (pid, window_id) replaces the entire entry.
 //!
 //! Memory contract:
-//!   tree::walk_element gives each actionable AXNode an RAII-owned retain.
+//!   tree::walk_element gives each addressable AXNode an RAII-owned retain.
 //!   Cache update clones that ownership; dropping either side releases exactly
 //!   its own retain, including cancelled or discarded tree-walk results.
 //!
