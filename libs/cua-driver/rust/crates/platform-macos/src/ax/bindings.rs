@@ -94,6 +94,11 @@ extern "C" {
         names: *mut CFArrayRef,
     ) -> AXError;
     pub fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    pub fn AXUIElementIsAttributeSettable(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        settable: *mut u8,
+    ) -> AXError;
     pub fn AXUIElementCopyElementAtPosition(
         application: AXUIElementRef,
         x: f32,
@@ -176,6 +181,19 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     }
     let s = CFStr::wrap_under_create_rule(value as _);
     Some(s.to_string())
+}
+
+/// Return whether an AX attribute can be written on this element.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) -> bool {
+    let attr = CFStr::new(attr_name);
+    let mut settable = 0_u8;
+    AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
+        == kAXErrorSuccess
+        && settable != 0
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on

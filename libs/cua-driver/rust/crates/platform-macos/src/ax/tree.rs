@@ -5,7 +5,8 @@
 //!   `INDENT- AXStaticText = "value"`  (non-indexed)
 //!
 //! Rules (from cua-driver reference):
-//! - An element is "actionable" (gets an index) when it has ≥1 action name.
+//! - An element is addressable (gets an index) when it has ≥1 action name or
+//!   exposes a settable AXValue (for example, a native text field).
 //! - Non-actionable leaf nodes with a value are rendered as `AXRole = "value"`.
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
@@ -244,6 +245,10 @@ where
     } else {
         ControlState::default()
     }
+}
+
+fn is_addressable(actions: &[String], value_settable: bool) -> bool {
+    !actions.is_empty() || value_settable
 }
 
 pub struct TreeWalkResult {
@@ -549,6 +554,10 @@ unsafe fn walk_element(
     let identifier = copy_string_attr(element, "AXIdentifier");
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
     let actions = copy_action_names(element);
+    // Native text fields commonly expose no AX action names even though their
+    // AXValue is writable. They still need an index and retained cache entry so
+    // callers can address them through set_value.
+    let value_settable = actions.is_empty() && is_attribute_settable(element, "AXValue");
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
@@ -556,7 +565,7 @@ unsafe fn walk_element(
 
     let has_content =
         !visible_title.is_empty() || !visible_description.is_empty() || !visible_value.is_empty();
-    let is_actionable = !actions.is_empty();
+    let is_actionable = is_addressable(&actions, value_settable);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         let read = copy_children_diagnostic(element);
@@ -583,7 +592,7 @@ unsafe fn walk_element(
 
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
-    // Structured `elements` only contains actionable nodes. Keep all new AX
+    // Structured `elements` only contains addressable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
     let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
         value_state: copied_value
@@ -831,6 +840,13 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn settable_value_without_actions_is_addressable() {
+        assert!(is_addressable(&[], true));
+        assert!(!is_addressable(&[], false));
+        assert!(is_addressable(&["AXPress".to_owned()], false));
+    }
 
     #[test]
     fn control_state_reads_are_gated_by_actionability() {

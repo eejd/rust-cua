@@ -726,16 +726,15 @@ fn degradation_for(
     Degradation::None
 }
 
-/// Render the actionable nodes from the AX walk into the
+/// Render the addressable nodes from the AX walk into the
 /// `structuredContent.elements` array shape described on the tool: one entry
 /// per node with an `element_index`, carrying role, label (built from
 /// title/description/value/identifier), frame, parent_index, depth, and —
 /// Surface 6 — an opaque `element_token` for the same row.
 ///
 /// Order matches the markdown rendering exactly (DFS, same indices). Only
-/// nodes that received an `element_index` (i.e. are addressable via
-/// click(element_index=N)) appear — non-actionable display-only rows are
-/// omitted to match the contract on the tool description.
+/// nodes that received an `element_index` (i.e. expose an AX action or a
+/// settable AXValue) appear. Display-only rows are omitted.
 pub(crate) fn build_elements_array_with_token(
     nodes: &[crate::ax::tree::AXNode],
     snapshot_id: u32,
