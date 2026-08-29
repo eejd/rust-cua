@@ -5,8 +5,9 @@
 //!   `INDENT- AXStaticText = "value"`  (non-indexed)
 //!
 //! Rules (from cua-driver reference):
-//! - An element is "actionable" (gets an index) when it has ≥1 action name.
-//! - Non-actionable leaf nodes with a value are rendered as `AXRole = "value"`.
+//! - An element is addressable (gets an index) when it has ≥1 action name or
+//!   exposes a settable AXValue (for example, a native text field).
+//! - Display-only leaf nodes with a value are rendered as `AXRole = "value"`.
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
 
@@ -106,7 +107,7 @@ impl Drop for OwnedAXElement {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
-    /// 0-based index (Some = actionable, None = non-actionable display-only node)
+    /// 0-based index (Some = addressable, None = display-only node)
     pub element_index: Option<usize>,
     pub role: String,
     /// AXTitle — shown as `"title"` in the tree line.
@@ -122,14 +123,14 @@ pub struct AXNode {
     pub actions: Vec<String>,
     /// The raw AXUIElementRef pointer value, for caching.
     pub element_ptr: usize,
-    /// Independent ownership for actionable elements. Non-actionable nodes do
-    /// not escape a walk as action targets and therefore carry no retain.
+    /// Independent ownership for addressable elements. Display-only nodes do
+    /// not escape a walk as operation targets and therefore carry no retain.
     pub(crate) element_owner: Option<OwnedAXElement>,
     /// Depth in the rendered markdown tree (matches the indent level used in
     /// `tree_markdown`). Layout containers AXScrollArea/AXGroup collapse so
     /// children share the parent's depth.
     pub depth: usize,
-    /// `element_index` of the nearest actionable ancestor, if any. Walks the
+    /// `element_index` of the nearest addressable ancestor, if any. Walks the
     /// rendered tree (so it skips collapsed layout containers).
     pub parent_element_index: Option<usize>,
     /// Screen-coordinate bounding rect `[x, y, width, height]` captured at
@@ -235,15 +236,19 @@ struct ControlState {
     selected: Option<bool>,
 }
 
-fn read_control_state_if_actionable<F>(is_actionable: bool, read: F) -> ControlState
+fn read_control_state_if_addressable<F>(is_addressable: bool, read: F) -> ControlState
 where
     F: FnOnce() -> ControlState,
 {
-    if is_actionable {
+    if is_addressable {
         read()
     } else {
         ControlState::default()
     }
+}
+
+fn is_addressable(actions: &[String], value_settable: bool) -> bool {
+    !actions.is_empty() || value_settable
 }
 
 pub struct TreeWalkResult {
@@ -506,7 +511,7 @@ unsafe fn walk_element(
     if role == "AXScrollArea" || role == "AXGroup" {
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
-        // parent_index (no actionable node was emitted here).
+        // parent_index (no addressable node was emitted here).
         let read = copy_children_diagnostic(element);
         child_diagnostics.record(&read);
         let children = read.elements;
@@ -549,6 +554,10 @@ unsafe fn walk_element(
     let identifier = copy_string_attr(element, "AXIdentifier");
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
     let actions = copy_action_names(element);
+    // Native text fields commonly expose no AX action names even though their
+    // AXValue is writable. They still need an index and retained cache entry so
+    // callers can address them through set_value.
+    let value_settable = actions.is_empty() && is_attribute_settable(element, "AXValue");
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
@@ -556,9 +565,9 @@ unsafe fn walk_element(
 
     let has_content =
         !visible_title.is_empty() || !visible_description.is_empty() || !visible_value.is_empty();
-    let is_actionable = !actions.is_empty();
+    let addressable = is_addressable(&actions, value_settable);
 
-    if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
+    if !addressable && !has_content && role != "AXWindow" && role != "AXSheet" {
         let read = copy_children_diagnostic(element);
         child_diagnostics.record(&read);
         let children = read.elements;
@@ -583,9 +592,9 @@ unsafe fn walk_element(
 
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
-    // Structured `elements` only contains actionable nodes. Keep all new AX
+    // Structured `elements` only contains addressable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
-    let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
+    let control_state = read_control_state_if_addressable(addressable, || ControlState {
         value_state: copied_value
             .map(|copied| copied.state_value)
             .filter(|v| !v.trim().is_empty())
@@ -600,10 +609,10 @@ unsafe fn walk_element(
         enabled: copy_bool_attr(element, "AXEnabled"),
         selected: copy_bool_attr(element, "AXSelected"),
     });
-    let node = if is_actionable {
+    let node = if addressable {
         let idx = *counter;
         *counter += 1;
-        // Own the actionable element independently of the traversal's child
+        // Own the addressable element independently of the traversal's child
         // reference. Cache snapshots clone this guard rather than stealing it.
         let element_owner = OwnedAXElement::retaining(element);
         AXNode {
@@ -676,8 +685,8 @@ unsafe fn walk_element(
     };
 
     // Track this node as the parent for its descendants only when it was
-    // assigned an element_index (mirrors what the markdown shows: only
-    // indexed rows are addressable in click(element_index=N)).
+    // assigned an element_index (mirrors what the markdown shows: only indexed
+    // rows are addressable; callers must choose a capability-compatible tool).
     let next_parent = node.element_index.or(parent_index);
 
     let line = format_node_line(&node);
@@ -833,9 +842,16 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn control_state_reads_are_gated_by_actionability() {
+    fn settable_value_without_actions_is_addressable() {
+        assert!(is_addressable(&[], true));
+        assert!(!is_addressable(&[], false));
+        assert!(is_addressable(&["AXPress".to_owned()], false));
+    }
+
+    #[test]
+    fn control_state_reads_are_gated_by_addressability() {
         let reads = Cell::new(0);
-        let display_only = read_control_state_if_actionable(false, || {
+        let display_only = read_control_state_if_addressable(false, || {
             reads.set(reads.get() + 1);
             ControlState {
                 enabled: Some(true),
@@ -845,15 +861,15 @@ mod tests {
         assert_eq!(reads.get(), 0, "display-only nodes must not read state");
         assert_eq!(display_only.enabled, None);
 
-        let actionable = read_control_state_if_actionable(true, || {
+        let addressable = read_control_state_if_addressable(true, || {
             reads.set(reads.get() + 1);
             ControlState {
                 enabled: Some(true),
                 ..ControlState::default()
             }
         });
-        assert_eq!(reads.get(), 1, "actionable nodes must read state once");
-        assert_eq!(actionable.enabled, Some(true));
+        assert_eq!(reads.get(), 1, "addressable nodes must read state once");
+        assert_eq!(addressable.enabled, Some(true));
     }
 
     #[test]
